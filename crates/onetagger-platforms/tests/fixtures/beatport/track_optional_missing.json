@@ -1,0 +1,16 @@
+{
+  "artists": [],
+  "exclusive": false,
+  "genre": {"id": 5, "name": "House"},
+  "id": 999999,
+  "mix_name": "Original Mix",
+  "name": "Sparse Track",
+  "release": {
+    "id": 888888,
+    "name": "Sparse Release",
+    "label": {"id": 77, "name": "Example Label"},
+    "image": {"id": 10, "dynamic_uri": "https://example.invalid/{w}x{h}/release.jpg"}
+  },
+  "remixers": [],
+  "slug": "sparse-track"
+}

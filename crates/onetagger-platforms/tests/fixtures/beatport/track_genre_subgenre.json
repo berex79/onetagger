@@ -1,0 +1,29 @@
+{
+  "artists": [{"id": 42, "name": "Example Artist"}],
+  "bpm": 128,
+  "catalog_number": "CAT-001",
+  "exclusive": false,
+  "genre": {"id": 5, "name": "House"},
+  "id": 123456,
+  "image": {"id": 9, "dynamic_uri": "https://example.invalid/{w}x{h}/track.jpg"},
+  "isrc": "GBABC2600001",
+  "key": {"id": 10, "name": "A Minor"},
+  "length_ms": 372000,
+  "mix_name": "Original Mix",
+  "name": "Example Track",
+  "number": 1,
+  "publish_date": "2026-07-01",
+  "release": {
+    "id": 654321,
+    "name": "Example Release",
+    "label": {"id": 77, "name": "Example Label"},
+    "image": {"id": 10, "dynamic_uri": "https://example.invalid/{w}x{h}/release.jpg"},
+    "upc": "123456789012",
+    "track_count": 2,
+    "artists": [{"id": 42, "name": "Example Artist"}]
+  },
+  "remixers": [],
+  "slug": "example-track",
+  "sub_genre": {"id": 15, "name": "Deep House"},
+  "new_release_date": "2026-07-02"
+}
