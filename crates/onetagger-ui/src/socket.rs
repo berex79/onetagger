@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use anyhow::Error;
 use axum::extract::ws::{WebSocket, Message};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 use onetagger_renamer::ac::Autocomplete;
@@ -372,7 +371,7 @@ async fn handle_message(text: &str, websocket: &mut WebSocket, context: &mut Soc
             })).await.ok();
         },
         Action::StopTagging => {
-            onetagger_autotag::STOP_TAGGING.store(true, Ordering::SeqCst);
+            onetagger_autotag::stop_tagging();
         },
         Action::Waveform { path } => {
             let source = AudioSources::from_path(&path)?;

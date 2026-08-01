@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use anyhow::Error;
 use onetagger_renamer::{Renamer, RenamerConfig, TemplateParser};
 use rand::seq::SliceRandom;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 use std::fs::File;
@@ -21,7 +21,7 @@ use reqwest::StatusCode;
 use walkdir::WalkDir;
 use chrono::Datelike;
 use serde::{Serialize, Deserialize};
-use crossbeam_channel::{unbounded, Sender, Receiver};
+use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use onetagger_tag::{AudioFileFormat, Tag, Field, TagDate, CoverType, TagImpl, EXTENSIONS};
 use onetagger_shared::Settings;
 use onetagger_player::AudioSources;
@@ -38,9 +38,20 @@ pub mod audiofeatures;
 pub use platforms::{AUTOTAGGER_PLATFORMS, AutotaggerPlatforms};
 
 
-lazy_static::lazy_static! {
-    /// Stop tagging global variable
-    pub static ref STOP_TAGGING: AtomicBool = AtomicBool::new(false);
+/// Each tagging run captures the current generation. Incrementing it cancels every
+/// active run without allowing an old worker to resume when a new run starts.
+static CANCELLATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn stop_tagging() {
+    CANCELLATION_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+fn cancellation_generation() -> u64 {
+    CANCELLATION_GENERATION.load(Ordering::SeqCst)
+}
+
+fn tagging_stopped(generation: u64) -> bool {
+    cancellation_generation() != generation
 }
 
 pub trait TaggerConfigExt {
@@ -630,7 +641,7 @@ impl Tagger {
 
     // Returtns progress receiver, and file count
     pub fn tag_files(cfg: &TaggerConfig, mut files: Vec<PathBuf>, finished: Arc<Mutex<Option<TaggerFinishedData>>>) -> Receiver<TaggingStatusWrap> {
-        STOP_TAGGING.store(false, Ordering::SeqCst);
+        let generation = cancellation_generation();
 
         // Shuffle so album tag is more "efficient"
         if cfg.album_tagging {
@@ -660,8 +671,8 @@ impl Tagger {
                 }
 
                 // Stop
-                if STOP_TAGGING.load(Ordering::SeqCst) {
-                    continue;
+                if tagging_stopped(generation) {
+                    break;
                 }
 
                 // Get tagger
@@ -678,7 +689,7 @@ impl Tagger {
                 if platform_info.max_threads > 0 && platform_info.max_threads < config.threads {
                     threads = platform_info.max_threads;
                 }
-                let rx = match Tagger::tag_batch(&files, tagger, &config, threads) {
+                let rx = match Tagger::tag_batch_cancellable(&files, tagger, &config, threads, generation) {
                     Some(t) => t,
                     None => {
                         error!("Failed creating platform: {platform:?}, skipping...");
@@ -687,7 +698,16 @@ impl Tagger {
                 };
                 // Start tagging
                 info!("Starting {platform}");
-                for status in rx {
+                loop {
+                    if tagging_stopped(generation) {
+                        info!("Stopping {platform} batch");
+                        break;
+                    }
+                    let status = match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(status) => status,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
                     info!("[{platform}] State: {:?}, Accuracy: {:?}, Path: {:?}", status.status, status.accuracy, status.path);
                     processed += 1;
                     // Send to UI
@@ -894,6 +914,12 @@ impl Tagger {
     pub fn tag_track<T>(path: impl AsRef<Path>, tagger: &mut Box<T>, config: &TaggerConfig) -> TaggingStatus 
     where T: AutotaggerSource + ?Sized
     {
+        Self::tag_track_cancellable(path, tagger, config, None)
+    }
+
+    fn tag_track_cancellable<T>(path: impl AsRef<Path>, tagger: &mut Box<T>, config: &TaggerConfig, generation: Option<u64>) -> TaggingStatus
+    where T: AutotaggerSource + ?Sized
+    {
         info!("Tagging: {:?}", path.as_ref());
         // Load track
         let (info, mut out) = Self::load_track(&path, config);
@@ -901,6 +927,12 @@ impl Tagger {
             Some(info) => info,
             None => return out,
         };
+
+        if generation.is_some_and(tagging_stopped) {
+            out.status = TaggingState::Skipped;
+            out.message = Some("Tagging stopped".to_string());
+            return out;
+        }
        
         // Match track
         let result = tagger.match_track(&info, &config);
@@ -920,6 +952,12 @@ impl Tagger {
             }
         };
 
+        if generation.is_some_and(tagging_stopped) {
+            out.status = TaggingState::Skipped;
+            out.message = Some("Tagging stopped".to_string());
+            return out;
+        }
+
         // Get & extend track
         MatchingUtils::sort_tracks(&mut tracks, config);
         let mut track = tracks.remove(0);
@@ -927,6 +965,12 @@ impl Tagger {
         match tagger.extend_track(&mut track.track, config) {
             Ok(_) => {},
             Err(e) => warn!("Failed extending track: {e}"),
+        }
+
+        if generation.is_some_and(tagging_stopped) {
+            out.status = TaggingState::Skipped;
+            out.message = Some("Tagging stopped".to_string());
+            return out;
         }
 
         // Save
@@ -948,6 +992,10 @@ impl Tagger {
 
     // Tag all files with threads specified in config
     pub fn tag_batch(files: &Vec<PathBuf>, tagger: &mut Box<dyn AutotaggerSourceBuilder + Send + Sync>, config: &TaggerConfig, threads: u16) -> Option<Receiver<TaggingStatus>> {
+        Self::tag_batch_cancellable(files, tagger, config, threads, cancellation_generation())
+    }
+
+    fn tag_batch_cancellable(files: &Vec<PathBuf>, tagger: &mut Box<dyn AutotaggerSourceBuilder + Send + Sync>, config: &TaggerConfig, threads: u16, generation: u64) -> Option<Receiver<TaggingStatus>> {
         info!("Starting tagging: {} files, {} threads!", files.len(), threads);
         let (tx, rx) = unbounded();
         let (file_tx, file_rx): (Sender<PathBuf>, Receiver<PathBuf>) = unbounded();
@@ -977,7 +1025,7 @@ impl Tagger {
             std::thread::spawn(move || {
                 while let Ok(f) = file_rx.recv() {
                     // Stop tagging
-                    if STOP_TAGGING.load(Ordering::SeqCst) {
+                    if tagging_stopped(generation) {
                         break;
                     }
 
@@ -987,7 +1035,7 @@ impl Tagger {
                     }
 
                     // Tag
-                    let res = Tagger::tag_track(&f, &mut source, &config);
+                    let res = Tagger::tag_track_cancellable(&f, &mut source, &config, Some(generation));
                     if config.album_tagging {
                         album_tagging.lock().unwrap().process(&res, &config);
                     }
@@ -1009,12 +1057,15 @@ impl Tagger {
                         // Check all album statuses
                         let album_tagging = album_tagging.lock().unwrap();
                         for (path, stats) in &album_tagging.folders {
+                            if tagging_stopped(generation) {
+                                break;
+                            }
                             if !stats.marked {
                                 continue;
                             }
 
                             // Tag
-                            match Self::tag_album(path, &stats.get_album_id().unwrap(), &mut source, &config) {
+                            match Self::tag_album_cancellable(path, &stats.get_album_id().unwrap(), &mut source, &config, Some(generation)) {
                                 Ok(statuses) => {
                                     for status in statuses {
                                         tx.send(status).ok();
@@ -1044,6 +1095,10 @@ impl Tagger {
 
     /// Tag an album by ID
     pub fn tag_album(path: impl AsRef<Path>, release_id: &str, source: &mut Box<dyn AutotaggerSource>, config: &TaggerConfig) -> Result<Vec<TaggingStatus>, Error> {
+        Self::tag_album_cancellable(path, release_id, source, config, None)
+    }
+
+    fn tag_album_cancellable(path: impl AsRef<Path>, release_id: &str, source: &mut Box<dyn AutotaggerSource>, config: &TaggerConfig, generation: Option<u64>) -> Result<Vec<TaggingStatus>, Error> {
         info!("Album tagging release: {release_id} in {}", path.as_ref().display());
 
         // Change strictness since we're working in context of album, and just care about most likely match
@@ -1056,6 +1111,9 @@ impl Tagger {
 
         // Get album
         let album = source.get_album(&release_id, &config)?.ok_or(anyhow!("Album with id: {release_id} not found"))?;
+        if generation.is_some_and(tagging_stopped) {
+            return Ok(vec![]);
+        }
         if album.tracks.is_empty() {
             return Err(anyhow!("Album {release_id} has no tracks!"))
         }
@@ -1065,6 +1123,9 @@ impl Tagger {
         // Load files
         let files = std::fs::read_dir(&path)?.filter_map(|e| e.ok()).map(|f| f.path()).collect::<Vec<_>>();
         for file in files {
+            if generation.is_some_and(tagging_stopped) {
+                break;
+            }
             let (info, mut status) = Self::load_track(&file, &config);
             let info = match info {
                 Some(i) => i,
@@ -1078,6 +1139,10 @@ impl Tagger {
             let mut tracks = MatchingUtils::match_track(&info, &album.tracks, &config, false);
             MatchingUtils::sort_tracks(&mut tracks, &config);
             let track = tracks.remove(0);
+
+            if generation.is_some_and(tagging_stopped) {
+                break;
+            }
             
             // TODO: Extend track if needed (?)
             if let Err(e) = track.track.merge_styles(&config.styles_options).write_to_file(&info.path, &config) {
@@ -1324,4 +1389,21 @@ pub fn manual_tagger_apply(mut matches: Vec<TrackMatch>, path: impl AsRef<Path>,
     // Save
     track.merge_styles(&config.styles_options).write_to_file(&path, &config)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::{cancellation_generation, stop_tagging, tagging_stopped};
+
+    #[test]
+    fn cancellation_only_stops_runs_from_an_older_generation() {
+        let active_run = cancellation_generation();
+        assert!(!tagging_stopped(active_run));
+
+        stop_tagging();
+        assert!(tagging_stopped(active_run));
+
+        let next_run = cancellation_generation();
+        assert!(!tagging_stopped(next_run));
+    }
 }

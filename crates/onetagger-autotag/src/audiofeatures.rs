@@ -1,6 +1,5 @@
 use anyhow::Error;
 use std::path::{PathBuf, Path};
-use std::sync::atomic::Ordering;
 use std::thread;
 use chrono::Local;
 use crossbeam_channel::{unbounded, Receiver};
@@ -11,7 +10,7 @@ use onetagger_platforms::spotify::{Spotify, rspotify};
 use onetagger_platforms::spotify::rspotify::model::track::FullTrack;
 use onetagger_tag::{Tag, AudioFileFormat, FrameName, TagSeparators};
 
-use crate::{TaggingState, TaggingStatus, TaggingStatusWrap, AudioFileInfoImpl, STOP_TAGGING};
+use crate::{cancellation_generation, tagging_stopped, TaggingState, TaggingStatus, TaggingStatusWrap, AudioFileInfoImpl};
 
 
 // Config from UI
@@ -167,14 +166,14 @@ pub struct AudioFeatures {}
 impl AudioFeatures {
     // Returtns progress receiver, and file count
     pub fn start_tagging(config: AudioFeaturesConfig, spotify: Spotify, files: Vec<PathBuf>) -> Receiver<TaggingStatusWrap> {
-        STOP_TAGGING.store(false, Ordering::SeqCst);
+        let generation = cancellation_generation();
         let file_count = files.len();
         // Start
         let (tx, rx) = unbounded();
         thread::spawn(move || {
             for (i, file) in files.iter().enumerate() {
                 // Stop tagging midway
-                if STOP_TAGGING.load(Ordering::SeqCst) {
+                if tagging_stopped(generation) {
                     break;
                 }
 
@@ -194,6 +193,9 @@ impl AudioFeatures {
                         // Match and get features
                         match AudioFeatures::find_features(&spotify, &info) {
                             Ok((features, full_track)) => {
+                                if tagging_stopped(generation) {
+                                    break;
+                                }
                                 // Write to file
                                 match AudioFeatures::write_to_path(&file, &features, &full_track, &config) {
                                     Ok(_) => {
