@@ -173,7 +173,6 @@ let timeInterval: any = undefined;
 
 // Conver platform name
 function platformText(p: string) {
-    if (p == 'junodownload') return 'JUNO DOWNLOAD';
     return p.toUpperCase();
 }
 

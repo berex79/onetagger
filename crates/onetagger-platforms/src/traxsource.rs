@@ -1,32 +1,47 @@
 use anyhow::Error;
-use reqwest::blocking::Client;
 use chrono::NaiveDate;
+use reqwest::blocking::Client;
+use reqwest::StatusCode;
 use scraper::{Html, Selector};
 use onetagger_tagger::{Track, AudioFileInfo, TaggerConfig, AutotaggerSource, MatchingUtils, TrackNumber, AutotaggerSourceBuilder, PlatformInfo, supported_tags, TrackMatch, SupportedTag};
 
 pub struct Traxsource {
-    client: Client
+    client: Client,
 }
 
 impl Traxsource {
     // Create new instance
-    pub fn new() -> Traxsource {
+    fn new() -> Result<Traxsource, Error> {
         let client = Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:85.0) Gecko/20100101 Firefox/85.0")
-            .build()
-            .unwrap();
-        Traxsource {
-            client
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+            .build()?;
+        Ok(Traxsource { client })
+    }
+
+    fn get_text(&self, url: &str) -> Result<String, Error> {
+        let response = self.client.get(url).send()?;
+        let cloudflare_challenge = response.status() == StatusCode::FORBIDDEN
+            || response.headers().get("cf-mitigated")
+                .and_then(|value| value.to_str().ok()) == Some("challenge");
+        if cloudflare_challenge {
+            return Err(anyhow!("Traxsource blocked OneTagger with a Cloudflare browser challenge. The Traxsource website may still work normally in a browser."));
         }
+
+        let data = response.error_for_status()?.text()?;
+        if is_cloudflare_challenge(&data) {
+            return Err(anyhow!("Traxsource returned a Cloudflare browser challenge."));
+        }
+        Ok(data)
     }
 
     pub fn search_tracks(&self, query: &str) -> Result<Vec<Track>, Error> {
         // Fetch
         debug!("Q: {}", query);
-        let data = self.client.get("https://www.traxsource.com/search/tracks")
-            .query(&[("term", query)])
-            .send()?
-            .text()?;
+        let url = reqwest::Url::parse_with_params(
+            "https://www.traxsource.com/search/tracks",
+            &[("term", query)]
+        )?;
+        let data = self.get_text(url.as_str())?;
 
         // Minify and parse
         let data = String::from_utf8(minify_html::minify(&data.as_bytes(), &minify_html::Cfg::new()))?;
@@ -122,9 +137,7 @@ impl Traxsource {
     // Tracks in search don't have album name and art
     pub fn extend_track_traxsource(&self, track: &mut Track, album_meta: bool, album_art: bool) -> Result<(), Error> {
         // Fetch
-        let data = self.client.get(&track.url)
-            .send()?
-            .text()?;
+        let data = self.get_text(&track.url)?;
         
         // Minify and parse
         let data = String::from_utf8(minify_html::minify(data.as_bytes(), &minify_html::Cfg::new()))?;
@@ -145,9 +158,7 @@ impl Traxsource {
         if !album_meta { 
             return Ok(());
         }
-        let data = self.client.get(format!("https://www.traxsource.com{}", album_url))
-            .send()?
-            .text()?;
+        let data = self.get_text(&format!("https://www.traxsource.com{}", album_url))?;
         // Minify and parse
         let data = String::from_utf8(minify_html::minify(data.as_bytes(), &minify_html::Cfg::new()))?;
         let document = Html::parse_document(&data);
@@ -229,7 +240,7 @@ impl AutotaggerSourceBuilder for TraxsourceBuilder {
     }
 
     fn get_source(&mut self, _config: &TaggerConfig) -> Result<Box<dyn AutotaggerSource>, Error> {
-        Ok(Box::new(Traxsource::new()))
+        Ok(Box::new(Traxsource::new()?))
     }
 
     fn info(&self) -> PlatformInfo {
@@ -245,4 +256,23 @@ impl AutotaggerSourceBuilder for TraxsourceBuilder {
             supported_tags: supported_tags!(Version, Artist, BPM, Key, Title, URL, Label, ReleaseDate, Genre, TrackId, Duration, Album, ReleaseId, CatalogNumber, AlbumArtist, TrackNumber, TrackTotal, AlbumArt)
         }
     }
+}
+
+fn is_cloudflare_challenge(html: &str) -> bool {
+    html.contains("challenges.cloudflare.com")
+        || html.contains("cf_chl_opt")
+        || html.contains("Enable JavaScript and cookies to continue")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cloudflare_challenge;
+
+    #[test]
+    fn recognizes_cloudflare_challenge_html() {
+        assert!(is_cloudflare_challenge("<script src=\"https://challenges.cloudflare.com/x\"></script>"));
+        assert!(is_cloudflare_challenge("Enable JavaScript and cookies to continue"));
+        assert!(!is_cloudflare_challenge("<div id=\"searchTrackList\"></div>"));
+    }
+
 }
